@@ -1,0 +1,909 @@
+---
+title: "Project - Customer LTV"
+author: "Tarun Grover"
+output:
+  html_document:
+    highlight: pygments
+    theme: lumen
+    toc: yes
+    toc_depth: 3
+  word_document:
+    toc: yes
+    toc_depth: '3'
+---
+
+#------------------------------------------------Part1-------------------------------------------
+
+```{r, message=FALSE}
+
+library(knitr)
+library(klaR)
+library(MASS)
+library(plyr)
+library(partykit)
+library(rpart)
+library(randomForest)
+library(pROC)
+library(gbm)
+library(dplyr)
+library(ggplot2) # graphics library
+library(ggcorrplot) #correlation plot
+library(GGally)  # additional library for viz
+library(tree)  
+library(factoextra)
+options(scipen = 4)
+options(stringsAsFactors = TRUE)
+
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+
+```
+
+
+Problem 1:	
+Develop an attrition model, to predict whether a customer will cancel their subscription in the near future. Characterize your model performance.
+
+
+Methodology:
+Since every user had multiple rows of data for every access he/she made to the website, We had to find a way to represent this in a more useful manner. We used the summary feature of R, to reformat the data and prepare new aggregated columns. Initially, we tried to identify as many features as possible. Then we plotted a correlation plot to identify and eliminate the correlated features. Once we had a set of feature vectors finalized, we applied four different clustering algorithms to classify if the customer would cancel the subscription or not.
+
+
+
+
+Features in the final output data frame(ltv.full.grouped): 
+
+- gender = 1 for Male, 0 for Female
+
+- pages = total no. pages accessed / total no. of subscription days
+
+- holiday = total holiday cards purchased / total no. of subscription days
+
+- num_times_visited = total no of rows
+
+- status = 1 if the subscription is cancelled, 0 if still a customer
+
+- days_since_last_visit = no of days since the customer is inactive
+
+
+
+### Loading the csv file data
+
+```{r}
+ltv.full <- read.csv("ltv.csv")
+ltv.full = data.frame(ltv.full)
+ltv.full$date = as.Date(ltv.full$date)
+
+```
+
+
+### Aggregating and Formatting the data
+
+##### Here we group the data by unique id, and use custom aggregation functions to normalize the features of every user. Following are the aggregation formulas used:
+
+
+```{r, cache=TRUE}
+#Grouping the data by ID
+
+ltv.grouped.data = ltv.full %>% group_by(id) %>% 
+  summarise(gender = gender, 
+            date_max = max(date),
+            date_min = min(date), 
+            pages = sum(pages), 
+            onsite = sum(onsite), 
+            entered = sum(entered), 
+            completed = sum(completed), 
+            holiday = sum(holiday), 
+            num_times_visited = n(),
+            status = max(status))
+
+#Removing duplicates
+ltv.grouped.data = unique(ltv.grouped.data)
+
+#Converting status labels to 0 and 1
+ltv.grouped.data$status=ifelse(ltv.grouped.data$status==2,1,0)
+
+#Converting gender to numeric labels 1=M and 0=F
+ltv.grouped.data$gender=ifelse(ltv.grouped.data$gender=='M',1,0)
+
+#creating a new column for days subscribed
+ltv.grouped.data$date_max = as.Date(ltv.grouped.data$date_max)
+ltv.grouped.data$date_min = as.Date(ltv.grouped.data$date_min)
+ltv.grouped.data$days_subscribed = ltv.grouped.data$date_max - ltv.grouped.data$date_min + 1
+ltv.grouped.data$days_since_last_visit = as.numeric(as.Date("2014-12-31") - ltv.grouped.data$date_max)
+
+
+#converting date and status to numeric
+ltv.grouped.data$date_max = as.numeric(ltv.grouped.data$date_max)
+ltv.grouped.data$date_min = as.numeric(ltv.grouped.data$date_min)
+ltv.grouped.data$days_subscribed = as.numeric(ltv.grouped.data$days_subscribed)
+ltv.grouped.data$status = as.numeric(ltv.grouped.data$status)
+
+
+```
+
+### Finding Correlations
+
+```{r}
+
+cor(ltv.grouped.data, method = "pearson")
+
+
+
+```
+### Updating the data to improve its feature vectors
+
+```{r}
+
+ltv.full = ltv.grouped.data
+
+ltv.full$pages = ltv.full$pages/ltv.full$days_subscribed
+ltv.full$onsite = ltv.full$onsite/ltv.full$days_subscribed
+ltv.full$entered = ltv.full$entered/ltv.full$days_subscribed
+ltv.full$completed = ltv.full$completed/ltv.full$days_subscribed
+ltv.full$holiday = ltv.full$holiday/ltv.full$days_subscribed
+
+ltv.full.normalized = ltv.full
+data.normalized = ltv.full.normalized[,2:13]
+data.normalized=data.frame(data.normalized)
+
+```
+
+
+### Finding Correlations
+
+```{r}
+cor(data.normalized, method = "pearson")
+```
+
+We remove date_max and date_min because they were only used as a dividing variable. From the above correlation plot, it can be noted that:
+- onsite is highly correlated with pages. So we remove onsite
+- entered is highly correlated with pages. So we remove entered.
+- completed is highly correlated with pages. So we remove completed.
+- days_subscribed is highly correlated with num_times_visited. So we remove days_subscirbed 
+
+
+### Final Correlations
+
+```{r, fig.height=10, fig.width=10}
+
+data.full = subset(data.normalized, select = -c(date_max, date_min, onsite, entered, completed, days_subscribed))
+
+#Plotting the correlation plot
+cor(data.full)
+
+
+matrix.numeric <- unlist(lapply(data.full, is.numeric))
+correlation = data.frame(cor(data.full[, matrix.numeric]))
+ggcorrplot(correlation)
+
+
+```
+
+Finally we can see very little correlation between the feature vectors. Let us perform classification using the above data and its feature vectors. 
+
+##### Splitting the data into train and test set
+
+```{r}
+# Randomly select 20% of the data to be held out for model validation
+test.indexes <- sample(1:nrow(data.full), round(0.2 * nrow(data.full)))
+train.indexes <- setdiff(1:nrow(data.full), test.indexes)
+
+# Splitting the data to train and test sets
+data.full.train <- data.full[train.indexes, ]
+data.full.test <- data.full[test.indexes, ]
+```
+
+
+###### The below command gives the ratio of cancelled customers to the total customers
+
+```{r}
+
+sum(data.full$status[data.full$status==1]) / nrow(data.full)
+
+```
+This implies that 63.17 % of the customers have unsubscribed over a period of time.
+
+
+
+
+### 6. Fitting a logistic regression
+
+
+```{r}
+
+k=5
+data_len = nrow(data.full.train)
+partition = data_len/k
+dataIndex = c(1:data_len)
+
+accuracy <- c()
+sensitivity <- c()
+specificity <- c()
+precision <- c()
+npv <- c()
+
+#the different cutoff values that we want to try
+thresholds = c(0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75)
+
+best_threshold = 0
+best_idx = 0
+best_accuracy = 0
+idx=0
+
+for (cutoff in thresholds){
+  
+  for(k_num in 1:k){
+    cvValIndex = seq(k_num*partition - partition +1, k_num*partition)
+    cvTrainIndex = dataIndex[-cvValIndex]
+    data.val = data.full[cvValIndex,]
+    
+    #Fitting the Logistic Regression Model
+    glm.model = glm(status ~ ., data = data.full.train, family=binomial(), subset = cvTrainIndex)
+    kable(summary(glm.model)$coef)
+    
+    #predicting the model on test data
+    glm.probs = predict(glm.model, data.val, type="response")
+    
+    #creating an array of "0" values
+    glm.pred.y = rep(0, nrow(data.val))
+    
+    #Adding "1" values where probability is >cutoff
+    glm.pred.y[glm.probs > cutoff] = 1
+  
+    
+    #confustion matrix
+    confusion.glm = table(glm.pred.y, data.val$status)
+  
+    
+    accuracy = append(accuracy, sum(diag(confusion.glm))/sum(confusion.glm))
+    sensitivity = append(sensitivity, confusion.glm[2,2]/sum(confusion.glm[,2]))
+    specificity = append(specificity, confusion.glm[1,1] / sum(confusion.glm[,1]))
+    precision = append(precision, confusion.glm[2,2] / sum(confusion.glm[2,]))
+    npv = append(npv, confusion.glm[1,1] / sum(confusion.glm[1,]))
+
+    }
+  
+  #plotting the ROC curve
+  cat("\nROC curve for probability threshold of ", cutoff)
+  roc.glm <- roc(data.val$status, glm.pred.y)
+  plot(roc.glm, col='green')
+  roc.glm$auc
+  
+  cat("\n-------------------Cutoff=",cutoff,"-------------------")
+  cat('\nLogistic Regression Mean Accuracy: ',mean(accuracy))
+  cat('\nLogistic Regression Mean Sensitivity: ',mean(sensitivity))
+  cat('\nLogistic Regression Mean Specificity: ',mean(specificity))
+  cat('\nLogistic Regression Mean Precision: ',mean(precision))
+  cat('\nLogistic Regression Mean NPV: ',mean(npv)) 
+  
+  if(mean(accuracy)>best_accuracy){
+    best_threshold = cutoff
+    best_idx = idx
+    best_accuracy = mean(accuracy)
+  }
+  idx=idx+1
+  
+  
+}
+cat("\n\n ------------------------- BEST RESULTS --------------------------")
+  cat("\nProbability Threshold =", best_threshold)
+  cat('\nAccuracy: ',accuracy[best_idx])
+  cat('\nSensitivity: ',sensitivity[best_idx])
+  cat('\nSpecificity: ',specificity[best_idx])
+  cat('\nPrecision: ',precision[best_idx])
+  cat('\nNPV: ',npv[best_idx]) 
+
+```
+```{r}
+
+glm.probs = predict(glm.model, data.full.test, type="response")
+    
+#creating an array of "0" values
+glm.pred.y = rep(0, nrow(data.full.test))
+    
+#Adding "1" values where probability is > 0.6
+glm.pred.y[glm.probs > 0.6] = 1
+  
+    
+#confustion matrix
+confusion.glm = table(glm.pred.y, data.full.test$status)
+  
+    
+cat("\n------------------- Test Performance -------------------")
+cat('\nLogistic Regression Mean Accuracy: ', sum(diag(confusion.glm))/sum(confusion.glm))
+cat('\nLogistic Regression Mean Sensitivity: ',confusion.glm[2,2]/sum(confusion.glm[,2]))
+cat('\nLogistic Regression Mean Specificity: ',confusion.glm[1,1] / sum(confusion.glm[,1]))
+cat('\nLogistic Regression Mean Precision: ',confusion.glm[2,2] / sum(confusion.glm[2,]))
+cat('\nLogistic Regression Mean NPV: ',confusion.glm[1,1] / sum(confusion.glm[1,])) 
+
+
+
+```
+
+The above logistic regression only gives an accuracy of 70%. Hence, we move on to fit a QDA model.
+
+
+### 7. Fitting a QDA Model
+
+Since we don't have to adjust any parameters in QDA, we perform it directly on the entire data with cross validation and calculate the average of the performance metrics.
+
+```{r}
+
+k=5
+data_len = nrow(data.full)
+partition = data_len/k
+dataIndex = c(1:data_len)
+
+accuracy <- c()
+sensitivity <- c()
+specificity <- c()
+precision <- c()
+npv <- c()
+
+for(k_num in 1:k){
+  cvValIndex = seq(k_num*partition - partition +1, k_num*partition)
+  cvTrainIndex = dataIndex[-cvValIndex]
+  data.val = data.full[cvValIndex,]
+
+  model.qda = qda(status~., data.full, subset = cvTrainIndex)
+  qda.predict = predict(model.qda, data.val)$class
+  confusion.qda = table(qda.predict, data.full$status[cvValIndex])
+
+  accuracy = append(accuracy, sum(diag(confusion.qda))/sum(confusion.qda))
+
+  accuracy = append(accuracy, sum(diag(confusion.qda))/sum(confusion.qda))
+  sensitivity = append(sensitivity, confusion.qda[2,2]/sum(confusion.qda[,2]))
+  specificity = append(specificity, confusion.qda[1,1] / sum(confusion.qda[,1]))
+  precision = append(precision, confusion.qda[2,2] / sum(confusion.qda[2,]))
+  npv = append(npv, confusion.qda[1,1] / sum(confusion.qda[1,]))
+  
+  
+}
+
+cat('\n--------------------------------QDA--------------------------------')
+cat('\nQDA Mean Accuracy: ',mean(accuracy))
+cat('\nQDA Mean Sensitivity: ',mean(sensitivity))
+cat('\nQDA Mean Specificity: ',mean(specificity))
+cat('\nQDA Mean Precision: ',mean(precision))
+cat('\nQDA Mean NPV: ',mean(npv))
+
+```
+
+The performance is not better than logistic regression. And even logistic regression does not have a very good classification accuracy.
+So we move on to try Randomforest Classification
+
+
+
+### 8. Fitting a Random Forest Model
+
+```{r}
+
+
+k=5
+data_len = nrow(data.full.train)
+partition = data_len/k
+dataIndex = c(1:data_len)
+
+accuracy <- c()
+sensitivity <- c()
+specificity <- c()
+precision <- c()
+npv <- c()
+
+best_threshold = 0
+best_idx = 0
+best_accuracy = 0
+idx=0
+
+#the different cutoff values that we want to try
+thresholds = c(0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75)
+
+for (cutoff in thresholds){
+
+  for(k_num in 1:k){
+    cvValIndex = seq(k_num*partition - partition +1, k_num*partition)
+    cvTrainIndex = dataIndex[-cvValIndex]
+    data.val = data.full.train[cvValIndex,]
+  
+    
+    model.rf.fit <- randomForest(status~., data=data.full.train, subset = cvTrainIndex)
+    #validation set probability
+    rf.val.prob <- predict(model.rf.fit, newdata = data.val)
+    #cutoff threshold
+    #cutoff = 0.5
+    #validation labels
+    rf.pred.y <- ifelse(rf.val.prob>cutoff, 1, 0)
+    #confustion matrix
+    confusion.rf = table(rf.pred.y, data.val$status)
+  
+    accuracy = append(accuracy, sum(diag(confusion.rf))/sum(confusion.rf))
+    sensitivity = append(sensitivity, confusion.rf[2,2]/sum(confusion.rf[,2]))
+    specificity = append(specificity, confusion.rf[1,1] / sum(confusion.rf[,1]))
+    precision = append(precision, confusion.rf[2,2] / sum(confusion.rf[2,]))
+    npv = append(npv, confusion.rf[1,1] / sum(confusion.rf[1,]))
+    
+  }
+  cat("\n-------------------Cutoff=",cutoff,"-------------------")
+  cat('\nRF Mean Accuracy: ',mean(accuracy))
+  cat('\nRF Mean Sensitivity: ',mean(sensitivity))
+  cat('\nRF Mean Specificity: ',mean(specificity))
+  cat('\nRF Mean Precision: ',mean(precision))
+  cat('\nRF Mean NPV: ',mean(npv))
+
+  
+  
+}
+
+
+```
+
+
+The above randomforest model gives the highest accuracy of 0.76235 at a threshold probability value of  0.6. However, since randomforest has the possibility of overfitting the data, we try fitting a boosted model as well.
+
+
+### 9. Fitting a Boosted Model
+
+```{r}
+
+set.seed(1)
+model.boost = gbm(formula = status~., data = data.full.train, distribution = "bernoulli", shrinkage = 0.05, n.trees = 1000, interaction.depth = 4, cv.folds = 5)
+
+#Selecting the best n-trees and plotting its graph
+best.ntrees = gbm.perf(model.boost, method = "cv")
+
+# Predicting on the test data to identify the probabilities
+boost.prob <- predict(object = model.boost, newdata = subset(data.full.test,select = -c(status)), n.trees = best.ntrees, type = "response")
+
+#calculating roc and auc values and plotting the curve
+roc.boost <- roc(data.full.test$status, boost.prob)
+plot(roc.boost, col='green')
+roc.boost$auc
+
+
+#the different cutoff values that we want to try
+thresholds = c(0.4, 0.45, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75)
+
+
+best_threshold = 0
+best_idx = 0
+best_accuracy = 0
+idx=0
+
+for (cutoff in thresholds){
+
+  boost.pred.y <- ifelse(boost.prob>cutoff, 1, 0)
+
+  confusion.boost = table(boost.pred.y, data.full.test$status, dnn = list("predicted", "observed"))
+  
+
+  accuracy = sum(diag(confusion.boost))/sum(confusion.boost)
+  sensitivity = confusion.boost[2,2]/sum(confusion.boost[,2])
+  specificity = confusion.boost[1,1] / sum(confusion.boost[,1])
+  precision = confusion.boost[2,2] / sum(confusion.boost[2,])
+  npv = confusion.boost[1,1] / sum(confusion.boost[1,])
+  
+  
+  cat('\n\n------------- Threshold =', cutoff,'---------------------')
+  cat('\nBoosting Fold Accuracies: ', accuracy)
+  cat('\nBoosting Fold Sensitivity: ', sensitivity)
+  cat('\nBoosting Fold Specificity: ', specificity)
+  cat('\nBoosting Fold Precision: ', precision)
+  cat('\nBoosting Fold NPV: ', npv)
+
+  }
+
+```
+
+###Finally we receive the best accuracy of 79.3% using the boosted model and a probability threshold of 0.4.
+
+#### We are not able to go beyond this accuracy rate because the data does not have very relevant set of features. We could have derived more relevent information from the data provided, if we spend considerable time in understanding the usage pattern and the service offering.
+
+
+#------------------------------------------------Part2-------------------------------------------
+
+Methodology
+The Lifetime Value of a customer is the total revenue earned by the company over the period of their relationship with the customer. In this data set, the subscription status of all 10000 customers was one of three options: "new", "open" or "cancelled". For this problem, "new" and "open" implies a subscription status where the customer is still active in the company and therefore it is not possible to calculate the LTV. Likewise, a subscription being cancelled implies that the customer is no longer with that customer base and therefore, LTV can be calculated.
+
+As a result, we filtered the data set by those customers who have already cancelled their service. From 10000 customers, we brought it down to 6317. To find the LTV of a customer, we use a method called the RFM(Recency, frequency, Monetary). To find the recency, that is the most recent date from which the customer cancelled, we took an analysis date of 1st of February 2015. We also found the frequency of subscription for the period of January 2011 to December 2014. To calculate the monetary aspect, we had to find out how much each customer had given for the number of months they were subscribed.
+
+To do this, we took the last date they subscribed at and substracted it from the first day they subscribed. The number of months was then multiplied the cost of a subscription each month($1). To calculate the LTV of the model, it would have been necessary for us to take the relative weights of each RFM and multiply it by each RFM variable. We decided to solve this another way. 
+
+For this next step, we rescaled to reduce the impact of outliers. Then we used K-Means clustering to group the cancelled customers into different clusters. Using NbClust brought a k value of 3. K Means divided our cohort into three groups of sizes 2897, 1939 and 1481.
+
+
+```{r, echo=FALSE}
+library(ISLR)
+library(ggplot2)
+library(ggcorrplot)
+library(GGally)
+library(leaps)
+library(splines)
+library(plyr)
+library(gam)
+library(glmnet)
+library(forcats)
+library(lubridate)
+library(tidyverse)
+library(dplyr)
+library(factoextra)
+library(NbClust)
+```
+
+```{r, echo=FALSE}
+ltv <- read.csv("ltv.csv")
+sum(is.na(ltv))
+ltv$date <- as.Date(ltv$date, "%Y-%m-%d")
+
+ltv.status <- filter(ltv, status==2)
+ltv.status <- subset(ltv.status, select=c(-pages, -completed, -entered, -holiday))
+
+
+
+ltv.0 <- filter(ltv, status==0)
+ltv.0 <- subset(ltv.0, select=c(-pages, -completed, -entered, -holiday))
+
+ltv.merged <- merge(x=ltv.status, y=ltv.0, by="id", all.x=TRUE)
+
+ltv.merged <- subset(ltv.merged, select=c(-onsite.x, -status.y, -gender.y, -onsite.y))
+
+
+#Find the diffference in the the period through which they subscribed. Multiply the difference by the number of months. That gives you the total revenue for the period subscribed
+ltv.merged$Monetary = as.character(round((ltv.merged$date.x - ltv.merged$date.y)/30))
+
+#Next drop all coluns except id and Monetary
+ltv.df <- subset(ltv.merged, select=c(-status.x, -gender.x, -date.x, -date.y))
+
+
+ltv <- ltv %>% 
+ mutate(status=as.factor(status), entered=as.factor(entered), 
+ date=as.Date(date, "%Y-%m-%d"), completed=as.factor(completed), 
+ holiday=as.factor(holiday))
+
+df_ltv <- ltv%>% select(id,date,status)
+
+analysis_date <- lubridate::as_date("2015–02–01")
+df_RFM <- ltv %>% 
+ group_by(id) %>% 
+ summarise(recency=as.numeric(analysis_date-max(date)),
+ frequency =n(), status)
+df_RFM
+
+RFM.status <- filter(df_RFM, status==2)
+
+ltv_RFM <- merge(x=RFM.status, y= ltv.df, by="id", all.x=TRUE)
+ltv_RFM$Monetary <- as.numeric(ltv_RFM$Monetary)
+ltv_RFM
+
+summary(ltv_RFM)
+```
+
+
+
+```{r, echo=FALSE}
+
+
+
+ltv_RFM1 <- subset(ltv_RFM, select=c(-status, -id))
+summary(ltv_RFM1)
+
+#Rescale to reduce the impact of outliers
+rescale_df <- ltv_RFM1 %>%
+  mutate(recency_scale = scale(recency),
+    frequency_scal = scale(frequency),
+    Monetary_scal = scale(Monetary)) %>%
+  select(-c(recency, frequency, Monetary))
+rescale_df
+
+
+set.seed(123)
+#nb <- NbClust(rescale_df, distance = "euclidean", min.nc = 2,
+ #       max.nc = 10, method = "kmeans")
+#fviz_nbclust(nb)
+results <- kmeans(rescale_df, 3)
+
+# Analyse clusters
+colMeans(ltv_RFM1[results$cluster == 1, 1:3])
+colMeans(ltv_RFM1[results$cluster == 2, 1:3])
+colMeans(ltv_RFM1[results$cluster == 3, 1:3])
+
+plot(ltv_RFM1[, 1:3], col = results$cluster, main = "Average scores for 3  LTV factors coloured by k-means cluster")
+
+
+```
+
+*Recommendation*
+  -The customers in Cluster 1 starting from the last day t the day of our analysis are those who have just recently subscribed, but do not subscribe that often and whose monetary value is very low.
+
+  -The customers in cluster 2 are those who have subscribed even earlier than Cluster 1, subscribe a lot and have a very significant monetary value.
+  
+  -The customers in Cluster 3 are those who have subscribed the most recent but do not subscibe frequently and a have a very low monetary value.
+  
+We would recommend to the company to focus their efforts on courting the cancelled subscribed customers that are in cluster 2.
+  
+References
+https://rpubs.com/hoakevinquach/Customer-Lifetime-Value-CLV
+https://medium.com/@triimamwicaksono_47213/customer-segmentation-and-strategy-using-rfm-analysis-in-rstudio-be79118c8235
+https://publisher.uthm.edu.my/ojs/index.php/ijie/article/view/4661
+
+
+
+#-----------------------------------------------Part3------------------------------------------
+
+Problem 3:	
+Develop a customer segmentation scheme. Include in this scheme the identification of sleeping customers, those that are no longer active but have not canceled their account. 
+
+Assumptions: 
+Here I will not be considering customers who have already unsubscribed(i.e. status =2) and we will not be segregating customers on gender since that would be like a very general segmentation.
+
+Methodology: 
+Per the EDA, I came up with a strategy to compute average pages, completed, onsite, holiday etc. i.e. total of these features divided the number of the days they have the subcsription for. Then I checked for corelation in the data and removed the features that were corelated and also added features like the number of days since their last data access and number of days they have accessed websites during their course of regsitration.
+
+Then after normalizing the data, I have applied K-means initially but then finally decided on Hierarichal clustering since I wanted nested clusters.
+
+Features in the final output data frame(ltv.full.grouped): Please uncomment last line to see clusters in a csv file.
+id: id of the customer
+pages: Number of pages visted by user 'id' during the period of their subcription.
+onsite: Number of minutes spent on site by user 'id' during the period of their subcription.
+entered: sum of flags indicating whether or not user entered the send order path during the period of their subcription.
+completed: sum of flags indicating whether the user completed the order during the period of their subcription.
+holiday: sum of flags indicating whether at least one completed order included a holiday themed card.
+num_times_visited: the number of different dates the customer visited the website.
+days_subscribed: the number of days since the customer subscribed to the website.
+days_since_last_vist: number of days elapsed since the customer last visited the website
+labels: which cluster the customer belogs to mostly based on (Active/Sleeping/Recently Joined and used a holiday card)
+
+
+### Preamble: Loading packages and data
+
+```{r}
+library(dplyr)
+library(gbm)
+library(factoextra)
+library(ggcorrplot)
+options(scipen = 4)
+options(stringsAsFactors = TRUE)
+
+```
+
+### Importing the dataset
+
+```{r}
+ltv.full <- read.csv("ltv.csv")
+ltv.full = data.frame(ltv.full)
+
+#summarizing the data set
+
+ltv.full$date = as.Date(ltv.full$date, format = "%d-%m-%Y")
+summary(ltv.full)
+
+```
+### checking for any missing values in the dataset
+
+```{r}
+
+for(i in 1:ncol(ltv.full)){
+  if(sum(is.na(ltv.full[,1])) != 0){
+    cat("Missing Value found")
+  }
+  else{
+    cat("\nNo missing value in col: ", i)
+  }
+}
+
+```
+
+### Creating a new data set of the users by grouping across full data set to get the last status, last visit date on website and sum of all pages, onsite, entered, completed and holiday across the entire dataset for a particular user.
+### This dataset additionally has the number of dates user visited the website.
+
+
+```{r, cache=TRUE}
+
+#ltv.full = ltv.full[1:100,]
+
+ltv.full.grouped = ltv.full %>% group_by(id) %>% 
+  summarise(status = max(status), gender = gender, date_max = max(date),date_min = min(date), pages = sum(pages), onsite = sum(onsite), entered = sum(entered), completed = sum(completed), holiday = sum(holiday), num_times_visited = n())
+
+ltv.full.grouped = unique(ltv.full.grouped)
+
+summary(ltv.full.grouped)
+
+```
+### Removing the users that have already unsuscribed and creating new columns for analysis.
+
+```{r}
+
+ltv.full.grouped = filter(ltv.full.grouped, status != 2)
+summary(ltv.full.grouped$status)
+
+ltv.full.grouped$date_max = as.Date(ltv.full.grouped$date_max)
+
+ltv.full.grouped$date_min = as.Date(ltv.full.grouped$date_min)
+
+ltv.full.grouped$days_subscribed = ltv.full.grouped$date_max - ltv.full.grouped$date_min + 1
+
+#ltv.full.grouped$gap_days_visit = ltv.full.grouped$days_subscribed/ltv.full.grouped$num_times_visited
+
+```
+### creating a new column for Days elapsed since last time the person visited the website
+
+```{r}
+ltv.full.grouped$days_since_last_visit = as.Date("2014-12-31") - ltv.full.grouped$date_max
+```
+
+### Updating dtypes for all columns as required.
+
+```{r}
+ltv.full.grouped$days_since_last_visit = as.numeric(ltv.full.grouped$days_since_last_visit)
+#ltv.full.grouped$gap_days_visit = as.numeric(ltv.full.grouped$gap_days_visit)
+ltv.full.grouped$days_subscribed = as.numeric(ltv.full.grouped$days_subscribed)
+ltv.full.grouped$date_max = as.numeric(ltv.full.grouped$date_max)
+ltv.full.grouped$date_min = as.numeric(ltv.full.grouped$date_min)
+ltv.full.grouped$gender = as.numeric(ltv.full.grouped$gender)
+ltv.full.grouped$status = as.numeric(ltv.full.grouped$status)
+summary(ltv.full.grouped$days_since_last_visit)
+summary(ltv.full.grouped)
+```
+### checking for corelation in data
+
+```{r}
+ltv.full.updated = ltv.full.grouped
+cor(ltv.full.updated, method = "pearson")
+```
+#plottinh high corelated features against each other.
+
+```{r}
+
+plot(ltv.full.updated$pages,ltv.full.updated$onsite, xlab = "number of pages", ylab = "number of minutes spent", col = "red")
+plot(ltv.full.updated$pages,ltv.full.updated$entered, xlab = "number of pages", ylab = "number of send oreder paths entered", col = "red")
+plot(ltv.full.updated$pages,ltv.full.updated$completed, xlab = "number of pages", ylab = "number of orders completed", col = "red")
+plot(ltv.full.updated$pages,ltv.full.updated$holiday, xlab = "number of pages", ylab = "number of orders with holiday themed card", col = "red")
+plot(ltv.full.updated$pages,ltv.full.updated$num_times_visited, xlab = "number of pages", ylab = "number times visited", col = "red")
+plot(ltv.full.updated$pages,ltv.full.updated$days_subscribed, xlab = "number of pages", ylab = "number of days since subscription", col = "red")
+
+```
+We can clearly see that those 5 variables are highly corelated with each other
+
+```{r}
+
+summary(ltv.full.updated$id)
+
+```
+
+
+### Since we have such a high corelation amongst things, I would proceed with average number of pages, onsites, completed, holiday by each id since(per) the person started the subscription.
+
+```{r}
+
+
+ltv.full.updated$pages = ltv.full.updated$pages/ltv.full.updated$days_subscribed
+ltv.full.updated$onsite = ltv.full.updated$onsite/ltv.full.updated$days_subscribed
+ltv.full.updated$entered = ltv.full.updated$entered/ltv.full.updated$days_subscribed
+ltv.full.updated$completed = ltv.full.updated$completed/ltv.full.updated$days_subscribed
+ltv.full.updated$holiday = ltv.full.updated$holiday/ltv.full.updated$days_subscribed
+
+cor(ltv.full.updated, method = "pearson")
+
+```
+
+### We will be dropping columns that will not be needed num_times_visited, status, days_subscribed, date_max, Date_min and making id as the index value
+
+```{r}
+
+
+ltv.full.updated.unnomralized = subset(ltv.full.updated, select = -c(num_times_visited,status,date_max,date_min,num_times_visited))
+
+
+ltv.full.updated.unnomralized
+
+```
+```{r}
+
+cor(ltv.full.updated.unnomralized)
+
+
+```
+### We can still see that data like pages, onsite, entered, completed are still highly corelated, hence we will be considering only pages in our further analysis.
+
+```{r}
+ltv.full.updated.unnomralized = subset(ltv.full.updated.unnomralized, select = -c(onsite,entered,completed))
+
+summary(ltv.full.updated.unnomralized)
+
+```
+
+#The plot below shows the need to noramlize the dataset.
+
+```{r}
+
+hist(ltv.full.updated.unnomralized$pages, c = "red", breaks = 6, main = "Pages")
+
+#print("----------------GRAD.RATE-----------------")
+hist(ltv.full.updated.unnomralized$holiday, c = "red", breaks = 6, main = "Holiday")
+```
+### a final corelation plot before normalizing the dataset
+
+```{r}
+
+cor(ltv.full.updated.unnomralized, method = "pearson")
+ggcorrplot(cor(ltv.full.updated.unnomralized), method="square",hc.order = TRUE, outline = "white",digits = 3)
+
+```
+
+#Scaling the data
+
+```{r}
+ltv.full.updated.nomralized = scale(subset(ltv.full.updated.unnomralized, select = -c(id,gender)))
+
+ltv.full.updated.nomralized = data.frame(ltv.full.updated.nomralized)
+
+#View(ltv.full.updated.nomralized)
+
+```
+
+#Trying K-means with different values of clusters
+
+```{r}
+km.out = kmeans(ltv.full.updated.nomralized,2,nstart = 20)
+fviz_cluster(km.out, data = ltv.full.updated.nomralized)
+
+km.out = kmeans(ltv.full.updated.nomralized,3,nstart = 20)
+fviz_cluster(km.out, data = ltv.full.updated.nomralized)
+
+km.out = kmeans(ltv.full.updated.nomralized,4,nstart = 20)
+fviz_cluster(km.out, data = ltv.full.updated.nomralized)
+
+km.out = kmeans(ltv.full.updated.nomralized,6,nstart = 20)
+fviz_cluster(km.out, data = ltv.full.updated.nomralized)
+
+```
+#Looking at the above cluster assignments, k-means does not make a good interpretaion since k-means assume the variance of the distribution of each attribute (variable) is spherical; all variables have the same variance; the prior probability for all k clusters are the same, i.e. each cluster has roughly equal number of observations, hence we do not get very good results.
+
+#Curve plotting for the best K.
+
+```{r}
+fviz_nbclust(ltv.full.updated.nomralized, kmeans, method = "wss") +
+  geom_vline(xintercept = 5, linetype = 2) + # add line for better visualisation
+  labs(subtitle = "Elbow method") # add subtitle
+```
+
+### Using Hierarichal clustering for customer segregation, since in this case I would opt for nested clusters.
+# Preferred Linkage: Complete as it measures difference based on the highes value among clusters.
+
+```{r}
+
+hc.complete = hclust(dist(ltv.full.updated.nomralized), method = "complete")
+hc.average = hclust(dist(ltv.full.updated.nomralized), method = "average")
+hc.single = hclust(dist(ltv.full.updated.nomralized), method = "single")
+
+plot(hc.complete,cex = 0.9)
+plot(hc.average,cex = 0.9)
+plot(hc.single,cex = 0.9)
+
+clusters.labels = cutree(hc.complete,3)
+
+```
+# The below code cell creates one data frame and updates the intial dataframe with labels. The newly created dataframe has 3 normalized features of pages, holidays and time elapsed since the customers last visit and that cluster it belongs to. For purposes of this segregation I would not be considering status and gender since they would result in obvious segregation of customers.
+
+
+```{r}
+
+
+ltv.cluster.labeled.normalized.hr = ltv.full.updated.nomralized
+clusters.labels = data.frame(clusters.labels)
+ltv.cluster.labeled.normalized.hr$labels = clusters.labels$clusters.labels
+ltv.full.grouped$labels = clusters.labels$clusters.labels
+ltv.full.grouped = select(ltv.full.grouped, filter = -c(date_max,date_min,status,gender))
+
+#write.csv(ltv.full.grouped,"segmented.csv")
+
+```
+
+
+#Cluster meanings:
+
+Cluster 1: Active Users, the cluster mostly have customers that have been using the website for sometime now are termed active based on the value of pages, onsites, completed per their visit.
+
+Cluster 2: This cluster entails Inactive customers aka sleeping customers. Here per the clusters any customer not accessed the website since more than a year has been characterized as Inactive. 
+
+Cluster 3: These are recently joined customers who have sent holiday card since the data is available till a december we see many of these customers sending a holiday card.
+
+#----------------------------------------THE END-------------------------------------------------------
